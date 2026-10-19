@@ -271,8 +271,12 @@ for (const initial of ["loose", "standard"] as const) {
 			use("standard");
 		}
 		expect(gate("change01")).toMatchObject({ verdict: "blocked", tally: { excused: 0, unexplained: 1 } });
+		const cause = h.call<InboxReply>("inbox", { kind: "failure", on: "pr:69" }).items;
+		expect(cause).toMatchObject([{ state: "open", title: "same cause" }]);
 		use("loose");
 		expect(gate("change01")).toMatchObject({ verdict: "passed", tally: { excused: 1, unexplained: 0 } });
+		expect(h.call<InboxReply>("inbox", { kind: "failure", on: "pr:69" }).items).toEqual([]);
+		expect(h.call("get", { refs: [cause[0]?.q] })).toMatchObject([{ state: "dissolved" }]);
 		const decided = h.call<InboxReply>("inbox", { state: "decided", kind: "failure", on: "pr:69" }).items;
 		expect(decided).toHaveLength(1);
 		expect(decided[0]).toMatchObject({
@@ -281,6 +285,25 @@ for (const initial of ["loose", "standard"] as const) {
 		expect(gate("base0001")).toMatchObject({ verdict: "blocked", tally: { excused: 0, unexplained: 1 } });
 	});
 }
+
+test("loose keeps a cause question open while one of its failures still needs an answer", () => {
+	h.close();
+	h = harness({ preset: "standard" });
+	base();
+	change({ 0: "same cause", 1: "same cause" });
+	const cause = h.call<InboxReply>("inbox", { kind: "failure", on: "pr:69" }).items[0];
+	if (!cause) throw new Error("missing cause question");
+	h.call("propose", { edits: [{ op: "policy", preset: "loose" }] });
+	const adoption = h.call<InboxReply>("inbox", { kind: "adopt" }).items[0];
+	if (!adoption) throw new Error("missing policy adoption");
+	expect(
+		h.call("decide", { q: adoption.q, onEvidence: adoption.evidenceHash, answer: { is: "accept" } }),
+	).toMatchObject([{ status: "decided" }]);
+	expect(gate("change01")).toMatchObject({ verdict: "blocked", tally: { excused: 1, unexplained: 1 } });
+	expect(h.call<InboxReply>("inbox", { kind: "failure", on: "pr:69" }).items).toMatchObject([
+		{ q: cause.q, state: "open", title: "same cause" },
+	]);
+});
 
 for (const answer of ["flaky", "defect", "inherited"] as const) {
 	test(`a direct ${answer} replacement of inherited standing uses manual failure holds`, () => {

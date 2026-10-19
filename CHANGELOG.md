@@ -2,6 +2,7 @@
 
 - 2026-10-18: **Fixed:** a private draft's timeline names its base version. Failed proposal answers keep newer timeline updates and read the case again. In the case pane, the required reason names Accept or Reject, keeps that answer while you type, and closes when the question is settled elsewhere. No stored data or API changes (issues #574, #445, #606).
 - 2026-10-18: **Fixed:** a report that corrects a result already replaced by another correction is refused with `conflict` before acceptance. This also protects run undo when another tab records a result while undo is sending. Read the latest results before correcting again. Identical report retries and archive history still work. Previously accepted branching corrections remain stored (issue #611).
+- 2026-10-18: **Fixed:** adopting a policy immediately applies its rules to eligible open questions, including sign-offs on planned runs. Cause questions leave Queue when restored inherited excuses mean they no longer block any run. Adopting `loose` therefore also accepts, at once, every pending proposal its rules accept. No stored data or API changes (issues #616 and #617).
 
 - 2026-10-18: **Fixed:** large folder proposals seal without rebuilding the whole folder tree after every creation, rename, or move. Collision checks and review of protected paths still include intermediate paths. No stored data or API changes (issue #581).
 

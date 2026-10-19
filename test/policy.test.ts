@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { ANSWER_KEYS, ANSWERS, type Ask, Clause, KINDS, type Policy, standingOf } from "../src/core/kinds.ts";
 import { parseCase } from "../src/core/markdown.ts";
 import { emptyBody } from "../src/core/model.ts";
-import type { GateStatus, InboxReply, ReportReceipt } from "../src/core/ops.ts";
+import type { GateStatus, InboxReply, PlanReply, ReportReceipt } from "../src/core/ops.ts";
 import { missingCatchAll, PRESET_NAMES, PRESETS } from "../src/core/presets.ts";
 import { actorByName, invitedPerson } from "../src/server/identity/identity.ts";
 import { Db } from "../src/server/kernel/db.ts";
@@ -1451,6 +1451,88 @@ describe("findings", () => {
 		const after = h.call<{ steps: { expected: string }[]; version: number }[]>("get", { refs: ["C-1"] })[0];
 		expect(after).toMatchObject({ version: 2 });
 		expect(first(after?.steps ?? []).expected).toBe("Total shows $90.00 (10% off $100.00)");
+	});
+});
+
+describe("policy adoption reconsiders open questions", () => {
+	test("new rules settle waiting proposals, findings and failures without another report", () => {
+		use("standard");
+		h.call("propose", { edits: [{ op: "create", outline: "Checkout works" }] });
+		const agent = h.actor("reviewer", "agent", ["read", "produce"]);
+		const pending = h.call<Proposed>("propose", { edits: [{ op: "create", outline: "Coupon works" }] }, agent);
+		h.call(
+			"claim",
+			{
+				lens: "review",
+				findings: [{ on: "C-1", category: "ambiguous", note: "Coupon handling needs review" }],
+			},
+			agent,
+		);
+		h.call("report", ciReport({ commit: "base0001", n: 1, fail: { 0: "runner unavailable" } }));
+		expect(queue().items.map((item) => item.kind)).toEqual(["failure", "finding", "adopt"]);
+		const clauses = PRESETS.loose.clauses.map((clause) => {
+			if (clause.id === "failure-any" || clause.id === "finding-any")
+				return {
+					...clause,
+					ask: { ...clause.ask, who: "rule" },
+					answer: { is: clause.kind === "failure" ? "infra" : "reject" },
+				};
+			return clause;
+		});
+		const policy = h.call<Policy & { version: number }>("admin", { do: "policy.show", project: "scratch" });
+		const proposed = h.call<Proposed>("propose", { edits: [{ op: "policy", base: policy.version, clauses }] });
+		const adoption = first(queue({ kind: "adopt", on: proposed.proposal }).items);
+		expect(
+			h.call("decide", { q: adoption.q, onEvidence: adoption.evidenceHash, answer: { is: "accept" } }),
+		).toMatchObject([{ status: "decided", effects: { ruled: 3 } }]);
+		expect(queue().items).toEqual([]);
+		expect(title("C-2")).toBe("Coupon works");
+		expect(first(queue({ kind: "adopt", on: pending.proposal, state: "decided" }).items)).toMatchObject({
+			decision: { answer: { is: "accept" }, by: ["policy"], rule: "adopt-any" },
+		});
+		expect(first(queue({ kind: "finding", state: "decided" }).items)).toMatchObject({
+			decision: { answer: { is: "reject" }, by: ["policy"], rule: "finding-any" },
+		});
+		expect(h.call("gate", { commit: "base0001" })).toMatchObject({
+			verdict: "passed",
+			tally: { excused: 1, unexplained: 0 },
+		});
+	});
+
+	test("loose closes a passed strict planned run on another line by rule", () => {
+		use("strict", "track");
+		const proposal = h.call<Proposed>("propose", { edits: [{ op: "create", outline: "Checkout works" }] });
+		const adoption = first(queue({ kind: "adopt", on: proposal.proposal }).items);
+		h.call("decide", {
+			q: adoption.q,
+			onEvidence: adoption.evidenceHash,
+			answer: { is: "accept" },
+			reason: "reviewed the case",
+		});
+		const planned = h.call<PlanReply>("plan", {
+			name: "another line",
+			select: { cases: ["C-1"] },
+			accepts: { commit: "base0001" },
+		});
+		h.call("report", {
+			run: planned.run,
+			target: { commit: "base0001", branch: "main" },
+			results: [{ test: { case: "C-1" }, outcome: "pass" }],
+		});
+		const signoff = first(queue({ kind: "signoff" }).items);
+		expect(signoff).toMatchObject({ state: "open", needs: "one member who is not an agent with a reason" });
+		expect(h.call("get", { refs: [planned.run] })).toMatchObject([{ state: "open", verdict: "passed" }]);
+		h.call("propose", { edits: [{ op: "policy", preset: "loose" }] });
+		const policy = first(queue({ kind: "adopt" }).items);
+		expect(h.call("decide", { q: policy.q, onEvidence: policy.evidenceHash, answer: { is: "accept" } })).toMatchObject([
+			{ status: "decided" },
+		]);
+		expect(h.call("get", { refs: [planned.run] })).toMatchObject([{ state: "closed", verdict: "passed" }]);
+		expect(queue({ kind: "signoff" }).items).toEqual([]);
+		expect(first(queue({ kind: "signoff", state: "decided" }).items)).toMatchObject({
+			q: signoff.q,
+			decision: { answer: { is: "approve" }, by: ["policy"], rule: "signoff-passed" },
+		});
 	});
 });
 

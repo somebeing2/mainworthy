@@ -444,17 +444,20 @@ function* settleByRuleSteps(
 	}
 }
 
-/** Reconcile existing inherited standing and let the new policy answer unlinked tests by rule. */
+/** Reconcile inherited standing and let the new policy answer every eligible open question by rule. */
 function* reconsiderPolicySteps(ctx: Ctx): Generator<undefined, number, void> {
-	for (const id of inheritanceRuns(ctx.db, ctx.project.id)) ctx.recompute.add(id);
+	refold(ctx, inheritanceRuns(ctx.db, ctx.project.id), { dissolveStale: true });
 	const policy = currentPolicy(ctx.db, ctx.project.id);
-	if (!policy.clauses.some((clause) => clause.kind === "map" && clause.ask.who === "rule")) return 0;
+	const kinds = new Set(policy.clauses.filter((clause) => clause.ask.who === "rule").map((clause) => clause.kind));
 	let taken = 0;
 	// Every one of them, by id: answering one changes the queue the loop would be reading.
-	for (const id of openQuestionIds(ctx.db, ctx.project.id, "map")) {
+	for (const id of [...kinds].flatMap((kind) => openQuestionIds(ctx.db, ctx.project.id, kind))) {
 		const question = questionById(ctx.db, id);
 		if (question?.state !== "open") continue;
-		const clause = clauseFor(policy, { kind: "map", facts: factsNow(ctx.db, question) });
+		const clause = clauseFor(currentPolicy(ctx.db, ctx.project.id), {
+			kind: question.kind,
+			facts: factsNow(ctx.db, question),
+		});
 		if (clause.ask.who !== "rule") continue;
 		if (heldOpen(ctx, question, question.basis) || overruled(ctx, question, clause.answer)) continue;
 		setQuestionAsk(ctx, question, clause.ask);
@@ -1719,8 +1722,7 @@ function dissolveStale(ctx: Ctx, { run, failing }: Pick<Retallied, "run" | "fail
 	}
 	// The latest tally includes rules applied while asking. Dissolving open questions changes no standing.
 	const shown = new Map<number, Set<string>>([[run.id, failing]]);
-	// One report can make thousands of questions go away, all waited for by the same run: it is recomputed once,
-	// when they are all closed, not once for each.
+	// Other runs waiting for these questions are recomputed once, after all stale questions are closed.
 	const waited = new Set<number>();
 	for (const id of candidates) {
 		const question = questionById(ctx.db, id);
