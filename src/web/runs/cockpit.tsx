@@ -6,7 +6,7 @@ import type { ReportReceipt } from "../../core/ops.ts";
 import { REPLIES } from "../../core/replies.ts";
 import { ApiError, call, UnreadableReply } from "../lib/api.ts";
 import { invalidateProject, queryClient, queryKey, useQueryOp } from "../lib/data.ts";
-import { deviceKey, deviceSession, sessionCurrent } from "../lib/device.ts";
+import { type DeviceSession, deviceKey, deviceSession, sessionCurrent } from "../lib/device.ts";
 import { randomId } from "../lib/ids.ts";
 import { type Binding, useBindings } from "../lib/keys.ts";
 import { navigate, refUrl, routeUrl } from "../lib/router.ts";
@@ -50,9 +50,33 @@ type PendingAttachment = AttachmentInput & { key: string };
 type RecordedResult = { fill: Fill; previous: Fill | null };
 type LastResult = { slot: Slot; outcome: RunOutcome; ready: Promise<RecordedResult> };
 
+function newRunReports() {
+	return {
+		confirmed: new Map<number, Slot>(),
+		writes: new Map<number, Promise<RecordedResult>>(),
+		uncertain: new Map<number, { message: string; retry: () => Promise<RecordedResult> }>(),
+		latest: new Map<number, Fill>(),
+		queued: new Map<number, number>(),
+		consumedNotes: new Map<number, string>(),
+		consumedSteps: new Map<number, string>(),
+	};
+}
+// Requests and their correction ancestry outlive the screen that started them, within this tab and session.
+const pendingRuns = new Map<string, { owner: DeviceSession; reports: ReturnType<typeof newRunReports> }>();
+function runReports(project: string, run: string, owner: DeviceSession) {
+	for (const [key, pending] of pendingRuns) if (!sessionCurrent(pending.owner)) pendingRuns.delete(key);
+	const key = JSON.stringify([project, run]);
+	const pending = pendingRuns.get(key);
+	if (pending) return pending.reports;
+	const reports = newRunReports();
+	pendingRuns.set(key, { owner, reports });
+	return reports;
+}
+
 export function RunCockpit({ runRef }: { runRef: string }) {
 	const { project, session, setStatus } = useApp();
 	const owner = useRef(deviceSession()).current;
+	const [reports] = useState(() => runReports(project, runRef, owner));
 	const runRead = useQueryOp({ project, op: "get", input: { refs: [runRef] } });
 	const parsedRun = Run.safeParse(runRead.data?.[0]);
 	const run = parsedRun.success && parsedRun.data.ref === runRef ? parsedRun.data : null;
@@ -70,15 +94,11 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 	});
 	const parsedSlots = Slot.array().safeParse(slotsRead.data?.pages.flatMap((page) => page.items));
 	const storedSlots = parsedSlots.success ? parsedSlots.data : [];
-	const confirmedSlots = useRef(new Map<number, Slot>());
-	for (const slot of storedSlots)
-		if (slot.fills.every((fill) => fill.result > 0)) confirmedSlots.current.set(slot.id, slot);
+	for (const slot of storedSlots) if (slot.fills.every((fill) => fill.result > 0)) reports.confirmed.set(slot.id, slot);
 	const [local, setLocal] = useState<Map<number, LocalFill>>(new Map());
 	const [cursor, setCursor] = useState<number | null>(null);
 	const stepPrefix = deviceKey("run-step", `${project}:${runRef}:`, owner.actorId);
 	const digitSequence = useRef({ slot: 0, at: 0 });
-	const consumedNotes = useRef(new Map<number, string>());
-	const consumedSteps = useRef(new Map<number, string>());
 	const [steps, setSteps] = useState<Record<string, string>>(() => readNotes(stepPrefix));
 	const [noting, setNoting] = useState<Slot | null>(null);
 	// A note belongs to its slot and is kept on this device from the first key until the server has the result:
@@ -87,7 +107,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 	const [notes, setNotes] = useState<Record<string, string>>(() => readNotes(notePrefix));
 	const setNoteOf = (slotId: number, text: string): void => {
 		if (!sessionCurrent(owner)) return;
-		consumedNotes.current.delete(slotId);
+		reports.consumedNotes.delete(slotId);
 		storeNote(`${notePrefix}${slotId}`, text);
 		setNotes((previous) => {
 			const next = { ...previous };
@@ -104,6 +124,18 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 		window.addEventListener("storage", changed);
 		return () => window.removeEventListener("storage", changed);
 	}, [notePrefix]);
+	useEffect(() => {
+		let mounted = true;
+		const settled = () => {
+			if (!mounted || !sessionCurrent(owner)) return;
+			setNotes(readNotes(notePrefix));
+			setSteps(readNotes(stepPrefix));
+		};
+		for (const request of reports.writes.values()) void request.then(settled, settled);
+		return () => {
+			mounted = false;
+		};
+	}, [reports, notePrefix, stepPrefix, owner]);
 	const pendingFiles = useRef(new Map<number, PendingAttachment[]>());
 	const consumedFiles = useRef(new Set<PendingAttachment>());
 	const readingFiles = useRef(new Set<number>());
@@ -149,11 +181,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 	}
 	const noteRef = useRef<HTMLInputElement>(null);
 	const [last, setLast] = useState<LastResult | null>(null);
-	const writes = useRef(new Map<number, Promise<RecordedResult>>());
-	const uncertain = useRef(new Map<number, { message: string; retry: () => Promise<RecordedResult> }>());
 	const withdrawn = useRef(new Set<Promise<RecordedResult>>());
-	const latest = useRef(new Map<number, Fill>());
-	const queued = useRef(new Map<number, number>());
 	const method = session.kind === "agent" ? "agent" : "human";
 	const slots: Slot[] = storedSlots.map((slot) => {
 		const own = local.get(slot.id);
@@ -172,7 +200,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 	function setStep(value: string | ((previous: string) => string)): void {
 		if (!current || !sessionCurrent(owner)) return;
 		const next = typeof value === "function" ? value(step) : value;
-		consumedSteps.current.delete(current.id);
+		reports.consumedSteps.delete(current.id);
 		storeNote(`${stepPrefix}${current.id}`, next);
 		setSteps((prior) => ({ ...prior, [current.id]: next }));
 	}
@@ -226,7 +254,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 	const canRecord = Boolean(
 		current &&
 			session.can.includes("produce") &&
-			(uncertain.current.has(current.id) || (!external(current) && run?.state === "open" && admittedMethod)),
+			(reports.uncertain.has(current.id) || (!external(current) && run?.state === "open" && admittedMethod)),
 	);
 	const allFilled = slots.length > 0 && !slots.some(missing) && !slotsRead.hasNextPage;
 	useEffect(() => {
@@ -252,20 +280,28 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 	function record(
 		outcome: RunOutcome,
 		slot = current,
-		text = slot && consumedNotes.current.get(slot.id) !== notes[slot.id] ? (notes[slot.id] ?? "") : "",
+		text = slot && reports.consumedNotes.get(slot.id) !== notes[slot.id] ? (notes[slot.id] ?? "") : "",
 		advance = true,
 		visibleStep = false,
 		restores?: Promise<RecordedResult>,
 	): Promise<RecordedResult> | null {
 		if (!slot || !sessionCurrent(owner) || !session.can.includes("produce")) return null;
-		const recovery = uncertain.current.get(slot.id);
+		const recovery = reports.uncertain.get(slot.id);
 		if (recovery) {
 			const recoveringSlot = slot;
 			const request = recovery.retry();
+			void request.then(
+				() => {
+					if (!sessionCurrent(owner)) return;
+					setNotes(readNotes(notePrefix));
+					setSteps(readNotes(stepPrefix));
+				},
+				() => {},
+			);
 			void request.catch((error: unknown) => {
 				if (sessionCurrent(owner))
 					setStatus(
-						uncertain.current.get(recoveringSlot.id)?.message ??
+						reports.uncertain.get(recoveringSlot.id)?.message ??
 							`${recoveringSlot.case} was not recorded: ${error instanceof Error ? error.message : "The request failed"}. Its note is kept.`,
 					);
 			});
@@ -328,17 +364,17 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 		// Undo records what was recorded before. A step marked since then is for the next failure: it is not
 		// used here and it stays, as a note typed since then does.
 		const failedStep =
-			!restores && outcome === "fail" && (visibleStep || consumedSteps.current.get(slot.id) !== marked)
+			!restores && outcome === "fail" && (visibleStep || reports.consumedSteps.get(slot.id) !== marked)
 				? Number(marked)
 				: 0;
-		if (text && text === notes[slot.id]) consumedNotes.current.set(slot.id, text);
-		if (!restores) consumedSteps.current.set(slot.id, marked);
-		const priorWrite = writes.current.get(slot.id);
-		const rollback = confirmedSlots.current.get(slot.id) ?? slot;
-		queued.current.set(slot.id, fill.result);
+		if (text && text === notes[slot.id]) reports.consumedNotes.set(slot.id, text);
+		if (!restores) reports.consumedSteps.set(slot.id, marked);
+		const priorWrite = reports.writes.get(slot.id);
+		const rollback = reports.confirmed.get(slot.id) ?? slot;
+		reports.queued.set(slot.id, fill.result);
 		const request = (async () => {
 			if (priorWrite) await priorWrite.catch(() => undefined);
-			const pending = uncertain.current.get(slot.id);
+			const pending = reports.uncertain.get(slot.id);
 			if (pending) await pending.retry();
 			const restoration = restores ? await restores : null;
 			if (restoration) {
@@ -347,10 +383,8 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 				text = earlier?.note ?? "Withdrawn by the author";
 			}
 			if (!sessionCurrent(owner)) throw new Error("The session changed. Your note is kept.");
-			const known = confirmedSlots.current
-				.get(slot.id)
-				?.fills.find((f) => f.by === session.actor && f.method === method);
-			const recent = latest.current.get(slot.id);
+			const known = reports.confirmed.get(slot.id)?.fills.find((f) => f.by === session.actor && f.method === method);
+			const recent = reports.latest.get(slot.id);
 			const previous = known && (!recent || known.result > recent.result) ? known : (recent ?? null);
 			if (restoration && previous?.result !== restoration.fill.result)
 				throw new Error("This result has changed since it was recorded. No correction was recorded.");
@@ -403,13 +437,13 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 			};
 			const complete = (receipt: ReportReceipt): RecordedResult => {
 				if (!sessionCurrent(owner)) throw new Error("The session changed. Your note is kept.");
-				uncertain.current.delete(slot.id);
+				reports.uncertain.delete(slot.id);
 				if (receipt.rejected.length || receipt.declined?.length || !receipt.results[0])
 					throw new Error(
 						receipt.rejected[0]?.reason ?? receipt.declined?.[0]?.reason ?? "The result was not recorded.",
 					);
 				const saved = { ...fill, outcome, note: text || null, result: receipt.results[0], atStep: atStep ?? null };
-				latest.current.set(slot.id, saved);
+				reports.latest.set(slot.id, saved);
 				if (files.length) {
 					for (const file of files) consumedFiles.current.delete(file);
 					pendingFiles.current.set(
@@ -422,7 +456,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 				// the request was on its way is newer than what was recorded, and stays.
 				if (storedNote(`${notePrefix}${slot.id}`) === text) setNoteOf(slot.id, "");
 				if (!restores) clearStep(slot.id, marked);
-				if (queued.current.get(slot.id) === fill.result)
+				if (reports.queued.get(slot.id) === fill.result)
 					setLocal((value) =>
 						new Map(value).set(slot.id, { fill: saved, questions: receipt.questions, pending: false }),
 					);
@@ -448,7 +482,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 							return complete(
 								await call("report", input, { project, owner }).catch((error: unknown) => {
 									if (error instanceof ApiError && error.status !== null && error.code !== "internal")
-										uncertain.current.delete(slot.id);
+										reports.uncertain.delete(slot.id);
 									throw error;
 								}),
 							);
@@ -460,20 +494,20 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 					});
 					return checking;
 				};
-				uncertain.current.set(slot.id, { message, retry });
+				reports.uncertain.set(slot.id, { message, retry });
 				setStatus(`${slot.case}'s outcome is unknown. Checking the original request; your note is kept.`);
 				return retry();
 			}
 			return complete(receipt);
 		})();
-		writes.current.set(slot.id, request);
+		reports.writes.set(slot.id, request);
 		void request.catch((error: unknown) => {
 			if (!sessionCurrent(owner)) return;
 			for (const file of files) consumedFiles.current.delete(file);
-			if (consumedNotes.current.get(slot.id) === text) consumedNotes.current.delete(slot.id);
-			if (consumedSteps.current.get(slot.id) === marked) consumedSteps.current.delete(slot.id);
-			if (writes.current.get(slot.id) !== request) return;
-			const restored = confirmedSlots.current.get(slot.id) ?? rollback;
+			if (reports.consumedNotes.get(slot.id) === text) reports.consumedNotes.delete(slot.id);
+			if (reports.consumedSteps.get(slot.id) === marked) reports.consumedSteps.delete(slot.id);
+			if (reports.writes.get(slot.id) !== request) return;
+			const restored = reports.confirmed.get(slot.id) ?? rollback;
 			queryClient.setQueryData<InfiniteData<Api["find"]["reply"]>>(
 				cacheKey,
 				(value) =>
@@ -493,7 +527,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 			setLast((value) => (value?.ready === request ? null : value));
 			// The person may already be typing another note. Restore the slot without changing their selection or input.
 			setStatus(
-				uncertain.current.get(slot.id)?.message ??
+				reports.uncertain.get(slot.id)?.message ??
 					`${slot.case} was not recorded: ${error instanceof Error ? error.message : "The request failed"}. Its note is kept. Return to the slot to retry.`,
 			);
 			void invalidateProject(project);
@@ -508,7 +542,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 	}
 	function startFail(): void {
 		if (!current || !canRecord) return;
-		if (uncertain.current.has(current.id)) {
+		if (reports.uncertain.has(current.id)) {
 			record("fail");
 			return;
 		}
@@ -517,7 +551,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 	}
 	function undo(): void {
 		if (!last || withdrawn.current.has(last.ready)) return;
-		const recovery = uncertain.current.get(last.slot.id);
+		const recovery = reports.uncertain.get(last.slot.id);
 		if (recovery) {
 			setStatus(recovery.message);
 			return;

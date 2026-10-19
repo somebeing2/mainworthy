@@ -106,8 +106,10 @@ If browser storage is available, the run keeps unfinished notes on this device u
 If a report's reply is lost, unreadable, interrupted by an internal server error, or arrives after
 you sign in again, the page keeps its outcome unknown and checks the original command.
 A command that has begun but not finished is sent again under the same ID.
-If the check fails, keep the page open and press a result key on that slot to check again.
+Leaving the cockpit for another screen and reopening it in the same tab keeps pending reports in order.
+If the check fails, press a result key on that slot to check again, including after leaving and reopening the cockpit.
 The original result and note are recovered before another result can be recorded.
+The report queue lasts until this tab reloads or its signed-in session changes.
 Before recording the result, paste a screenshot into **Result note** or choose **Attach a file**.
 Pending files stay with their slot while you move between slots.
 Closing or reloading the page discards pending files. A saved result shows its images and file

@@ -3,7 +3,7 @@ import type { Page } from "playwright-core";
 import { z } from "zod";
 import { AttachmentReply } from "../../src/core/attachments.ts";
 import { Slot } from "../../src/web/runs/models.ts";
-import { browserAvailable, eventually, openPage, type Server, startServer } from "./support.ts";
+import { answer, browserAvailable, eventually, fetched, openPage, type Server, startServer } from "./support.ts";
 
 const check = browserAvailable ? test : test.skip;
 
@@ -56,6 +56,118 @@ async function fail(page: Page, note: string) {
 async function slots(server: Server, run: string) {
 	return Slot.array().parse((await server.api("find", { in: "slots", run })).items);
 }
+
+check(
+	"reopening the cockpit keeps a pending failure before its later pass (632)",
+	async () => {
+		const { server, run, path } = await fixture(2);
+		let view: Awaited<ReturnType<typeof openPage>> | null = null;
+		const held = Promise.withResolvers<void>();
+		const sent = Promise.withResolvers<void>();
+		const passed = Promise.withResolvers<void>();
+		const delivered = Promise.withResolvers<void>();
+		const Reported = z.object({ outcome: z.string(), corrects: z.number().optional() });
+		const reports: z.infer<typeof Reported>[] = [];
+		try {
+			view = await openPage(server, { path });
+			const { page } = view;
+			await ready(page);
+			await page.route("**/report", async (route) => {
+				const input = z.object({ results: Reported.array() }).parse(route.request().postDataJSON());
+				const result = input.results[0];
+				if (!result) throw new Error("Missing report result");
+				reports.push(result);
+				if (reports.length === 1) {
+					sent.resolve();
+					await held.promise;
+				}
+				const response = await fetched(route);
+				if (!response) return;
+				await answer(route, { response: response.response });
+				if (result.outcome === "pass") passed.resolve();
+				else delivered.resolve();
+			});
+			await fail(page, "Older failure");
+			await sent.promise;
+			await page.locator("#list").getByRole("link", { name: "Runs", exact: true }).click();
+			await page.getByRole("option").filter({ hasText: "Cockpit corrections" }).click();
+			await page.keyboard.press("Enter");
+			await page.locator('[data-slot="1"]').click();
+			await ready(page);
+			await page.keyboard.press("p");
+			// A broken queue sends the pass first. A preserved queue waits for the held failure.
+			await Promise.race([passed.promise, Bun.sleep(1000)]);
+			held.resolve();
+			await Promise.all([passed.promise, delivered.promise]);
+			const rows = await slots(server, run);
+			const gate = await server.api("gate", { run });
+			await page.locator(".run-verdict").filter({ hasText: gate.reason }).waitFor();
+			await screenshot(page, 632);
+			expect(rows[0]?.state).toBe("satisfied");
+			expect(rows[0]?.fills).toMatchObject([{ outcome: "pass", note: null }]);
+			expect(rows[0]?.fills).toHaveLength(1);
+			expect(rows[1]?.state).toBe("missing");
+			expect((await server.api("gate", { run })).verdict).toBe("pending");
+			const history = (await server.api("timeline", { ref: "C-1" })).entries.filter((entry) => entry.t === "result");
+			expect(history.map((entry) => entry.outcome)).toEqual(["pass", "fail"]);
+			expect(reports).toEqual([{ outcome: "fail" }, { outcome: "pass", corrects: history[1]?.id }]);
+		} finally {
+			held.resolve();
+			await view?.close();
+			await server.stop();
+		}
+	},
+	30_000,
+);
+
+check(
+	"reopening the cockpit resolves its uncertain report before a correction (632)",
+	async () => {
+		const { server, run, path } = await fixture(2);
+		let view: Awaited<ReturnType<typeof openPage>> | null = null;
+		try {
+			view = await openPage(server, { path });
+			const { page } = view;
+			await ready(page);
+			const reports: unknown[] = [];
+			await page.route("**/report", (route) => {
+				reports.push(route.request().postDataJSON());
+				return reports.length === 1 ? route.abort() : route.continue();
+			});
+			await page.route("**/command", (route) => route.abort());
+			await fail(page, "Uncertain failure");
+			await page
+				.locator("#stat")
+				.filter({ hasText: "check the same request before recording another result" })
+				.waitFor();
+			await page.locator("#list").getByRole("link", { name: "Runs", exact: true }).click();
+			await page.getByRole("option").filter({ hasText: "Cockpit corrections" }).click();
+			await page.keyboard.press("Enter");
+			await page.locator('[data-slot="1"]').click();
+			await ready(page);
+			await page.unroute("**/command");
+			await page.keyboard.press("p");
+			await page.locator("#stat").filter({ hasText: "C-1 fail recorded" }).waitFor();
+			expect(reports).toHaveLength(2);
+			expect(reports[1]).toEqual(reports[0]);
+			const recovered = (await slots(server, run))[0]?.fills[0];
+			expect(recovered).toMatchObject({ outcome: "fail", note: "Uncertain failure" });
+			expect(await page.getByRole("textbox", { name: "Result note" }).inputValue()).toBe("");
+			await page.keyboard.press("p");
+			await page.locator("#stat").filter({ hasText: "C-1 pass recorded" }).waitFor();
+			const rows = await slots(server, run);
+			expect(rows[0]?.fills).toMatchObject([{ outcome: "pass", note: null }]);
+			expect(rows[0]?.fills).toHaveLength(1);
+			expect(rows[0]?.state).toBe("satisfied");
+			expect((await server.api("gate", { run })).verdict).toBe("pending");
+			expect(reports[2]).toMatchObject({ results: [{ outcome: "pass", corrects: recovered?.result }] });
+		} finally {
+			await view?.close();
+			await server.stop();
+		}
+	},
+	30_000,
+);
 
 check(
 	"undo preserves a newer failure recorded in another tab (542)",
