@@ -188,8 +188,17 @@ Existing duplicate paths do not block unrelated edits or a rename to a free path
 Path comparisons ignore letter case and use the Unicode cleaning described in [scope clauses](./policy.md#limit-agent-edits-by-folder-or-tag).
 Creating or moving a case to an existing path uses that folder.
 The server checks the final paths of a whole proposal again when accepting it.
-Folder edits apply in order. A path that temporarily names two folders cannot be used to create a child folder during that batch.
+Folder edits apply in order. A path that temporarily names two folders cannot be used as a destination during that batch.
 Reorder the edits so that the path is unique first.
+A pending proposal replays against the current folders. If a destination becomes ambiguous during replay,
+its question stays visible in Queue and names the ambiguous path. You can reject it without changing the folders.
+Accepting it is refused without applying any edits. Restore a unique destination before accepting it.
+A refused replay still checks the policy against later edits and all candidate folders, including their paths and case tags.
+It combines the requirements of every clause a resolution could select, so an earlier, looser folder clause cannot weaken review.
+Conflicting role or author requirements need an admin. A person answers a refused replay, even where a rule would normally answer.
+For a large or deep refused batch, any folder condition in the policy may apply, along with tags from any current folder.
+Rejecting it may therefore need a reviewer or reason for an unrelated folder.
+The policy's role and reason requirements also apply when rejecting the proposal.
 You can combine folder creations, renames, moves, and case placement in one proposal.
 
 Press <kbd>x</kbd> on each case you want to select for a bulk action.

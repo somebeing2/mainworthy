@@ -777,6 +777,7 @@ export function* sealSteps(ctx: Ctx, input: Parameters<typeof seal>[1]): Generat
 	}
 
 	const folders = yield* projectFoldersSteps(index, resolved);
+	if (folders.refusal?.kind === "ambiguous") throw invalid(folders.refusal.message);
 	validateFolderPaths(index, folders);
 	const facts = [`author:${ctx.actor.kind}`, ...(yield* scopeFactsSteps(ctx.db, ctx.project.id, resolved, folders))];
 	if (conflicts.length > 0) facts.push("conflict");
@@ -818,8 +819,7 @@ type FolderProjection = {
 	placed: Map<number, number>;
 	touched: Set<number>;
 	paths: Set<string>;
-	ambiguousTargets: Set<string>;
-	refusal: string | null;
+	refusal: { kind: "ambiguous" | "self-move"; message: string } | null;
 };
 
 /** Replay placement and folder edits in adoption order; new folders have proposal-local negative ids. */
@@ -882,14 +882,25 @@ function* projectFoldersSteps(
 	const placed = new Map<number, number>();
 	const touched = new Set<number>();
 	const paths = new Set<string>();
-	const ambiguousTargets = new Set<string>();
-	const ensure = (target: FolderTarget): number => {
+	const refused = (kind: "ambiguous" | "self-move", message: string): FolderProjection => ({
+		after,
+		targets,
+		placed,
+		touched,
+		paths,
+		refusal: { kind, message },
+	});
+	const ensure = (target: FolderTarget): number | FolderProjection => {
 		if ("id" in target) return target.id;
 		let parent: number | null = null;
 		let walked = "";
 		for (const name of cleanPath(target.path)) {
 			walked = walked ? `${walked}/${name}` : name;
-			if (after.ambiguous.has(walked.toLowerCase())) ambiguousTargets.add(walked);
+			if (after.ambiguous.has(walked.toLowerCase()))
+				return refused(
+					"ambiguous",
+					`folder path "${walked}" is ambiguous during the proposal; reorder the folder edits`,
+				);
 			const existing = after.byPath.get(walked.toLowerCase());
 			if (existing) parent = existing.id;
 			else {
@@ -905,10 +916,12 @@ function* projectFoldersSteps(
 		if (++work % SLICE === 0) yield;
 		if (edit.op === "create") {
 			const folder = ensure(edit.folder);
+			if (typeof folder !== "number") return folder;
 			targets.set(edit, folder);
 			paths.add(after.path(folder));
 		} else if (edit.op === "place" && edit.folder) {
 			const folder = ensure(edit.folder);
+			if (typeof folder !== "number") return folder;
 			targets.set(edit, folder);
 			paths.add(after.path(folder));
 			for (const id of edit.caseIds) {
@@ -917,17 +930,10 @@ function* projectFoldersSteps(
 			}
 		} else if (edit.op === "folder") {
 			const parent = edit.parent === undefined ? undefined : edit.parent === null ? null : ensure(edit.parent);
+			if (typeof parent === "object" && parent !== null) return parent;
 			if (edit.id !== null && parent !== undefined && parent !== null && isInside(after, parent, edit.id)) {
 				// An invalid pending proposal must still be readable and rejectable.
-				return {
-					after,
-					targets,
-					placed,
-					touched,
-					paths,
-					ambiguousTargets,
-					refusal: "a folder cannot be moved into itself or into a folder inside it",
-				};
+				return refused("self-move", "a folder cannot be moved into itself or into a folder inside it");
 			}
 			if (edit.id === null) {
 				const row = { id: nextId--, parent: parent ?? null, name: edit.name ?? "Untitled" };
@@ -960,12 +966,133 @@ function* projectFoldersSteps(
 			}
 		}
 	}
-	return { after, targets, placed, touched, paths, ambiguousTargets, refusal: null };
+	return { after, targets, placed, touched, paths, refusal: null };
 }
 
-function validateFolderPaths(index: FolderIndex, { after, ambiguousTargets }: FolderProjection): void {
-	for (const path of ambiguousTargets)
-		throw invalid(`folder path "${path}" is ambiguous during the proposal; reorder the folder edits`);
+/** A refused replay keeps every possible name and parent; no candidate is chosen for adoption. */
+function* refusedFolderScopesSteps(
+	index: FolderIndex,
+	edits: readonly Resolved[],
+	affected: Set<number>,
+): Generator<undefined, Map<number, Set<string>> | null, void> {
+	const exhausted = new Error("refused folder scope budget exhausted");
+	let remaining = 16_384;
+	const spend = () => {
+		if (--remaining < 0) throw exhausted;
+	};
+	try {
+		const rows = new Map(
+			[...index.byId.values()].map((row) => [
+				row.id,
+				{
+					names: new Set([row.name]),
+					parents: new Set([row.parent]),
+				},
+			]),
+		);
+		const pathsOf = (id: number, seen = new Set<number>()): Set<string> => {
+			spend();
+			const paths = new Set<string>();
+			const row = rows.get(id);
+			if (!row || seen.has(id)) return paths;
+			const branch = new Set([...seen, id]);
+			for (const parent of row.parents) {
+				spend();
+				const prefixes = parent === null ? [""] : pathsOf(parent, branch);
+				for (const prefix of prefixes)
+					for (const name of row.names) {
+						spend();
+						paths.add(prefix ? `${prefix}/${name}` : name);
+					}
+			}
+			return paths;
+		};
+		let nextId = -1;
+		const ensure = (target: FolderTarget): Set<number> => {
+			if ("id" in target) return new Set([target.id]);
+			let parents = new Set<number | null>([null]);
+			let walked = "";
+			for (const name of cleanPath(target.path)) {
+				spend();
+				walked = walked ? `${walked}/${name}` : name;
+				const found = new Set<number>();
+				for (const id of rows.keys()) {
+					spend();
+					if ([...pathsOf(id)].some((path) => cleanPath(path).join("/").toLowerCase() === walked.toLowerCase()))
+						found.add(id);
+				}
+				// A renamed or moved candidate may have freed this child path in another replay.
+				const missing = new Set(
+					[...parents].filter(
+						(parent) =>
+							![...found].some((id) => {
+								spend();
+								const row = rows.get(id);
+								return row?.names.size === 1 && row.parents.size === 1 && row.parents.has(parent);
+							}),
+					),
+				);
+				for (const parent of missing) {
+					spend();
+					const id = nextId--;
+					rows.set(id, { names: new Set([name]), parents: new Set([parent]) });
+					found.add(id);
+				}
+				parents = found;
+			}
+			return new Set([...parents].filter((id) => id !== null));
+		};
+		let work = 0;
+		for (const edit of edits) {
+			spend();
+			if (++work % SLICE === 0) yield;
+			if (edit.op === "create" || (edit.op === "place" && edit.folder)) {
+				if (edit.folder) for (const id of ensure(edit.folder)) affected.add(id);
+			} else if (edit.op === "folder") {
+				const parents = edit.parent === undefined ? null : edit.parent === null ? new Set([null]) : ensure(edit.parent);
+				if (parents) for (const id of parents) if (id !== null) affected.add(id);
+				if (edit.id === null) {
+					const id = nextId--;
+					rows.set(id, { names: new Set([edit.name ?? "Untitled"]), parents: new Set(parents ?? [null]) });
+					affected.add(id);
+				} else {
+					const row = rows.get(edit.id);
+					if (!row) throw notFound(`folder ${edit.id}`);
+					if (edit.name !== null) row.names.add(edit.name);
+					if (parents) for (const parent of parents) row.parents.add(parent);
+					affected.add(edit.id);
+				}
+			}
+		}
+		const children = new Map<number, Set<number>>();
+		for (const [id, row] of rows) {
+			for (const parent of row.parents) {
+				spend();
+				if (parent === null) continue;
+				let bucket = children.get(parent);
+				if (!bucket) {
+					bucket = new Set();
+					children.set(parent, bucket);
+				}
+				bucket.add(id);
+			}
+			if (++work % SLICE === 0) yield;
+		}
+		const scopes = new Map<number, Set<string>>();
+		for (const id of affected) {
+			spend();
+			for (const child of children.get(id) ?? []) affected.add(child);
+			scopes.set(id, pathsOf(id));
+			if (++work % SLICE === 0) yield;
+		}
+		return scopes;
+	} catch (error) {
+		if (error === exhausted) return null;
+		throw error;
+	}
+}
+
+function validateFolderPaths(index: FolderIndex, { after }: FolderProjection): void {
 	const paths = new Map<string, number>();
 	for (const row of after.byId.values()) {
 		const path = cleanPath(after.path(row.id)).join("/");
@@ -992,8 +1119,10 @@ export function* scopeFactsSteps(
 	projection?: FolderProjection,
 ): Generator<undefined, string[], void> {
 	const index = folderIndex(db, project);
-	const { after, targets, placed, touched, paths } = projection ?? (yield* projectFoldersSteps(index, edits));
+	const { after, targets, placed, touched, paths, refusal } = projection ?? (yield* projectFoldersSteps(index, edits));
 	const facts = new Set<string>();
+	if (refusal) facts.add("replay:refused");
+	if (refusal?.kind === "ambiguous") facts.add(`refused:${refusal.message}`);
 	const folder = (path: string) => {
 		const parts = cleanPath(path.toLowerCase());
 		for (let n = 1; n <= parts.length; n++) facts.add(`folder:${parts.slice(0, n).join("/")}`);
@@ -1003,9 +1132,11 @@ export function* scopeFactsSteps(
 	const tags = (values: readonly string[]) => {
 		for (const tag of values) facts.add(`tag:${cleanTag(tag)}`);
 	};
+	const referencedFolders = new Set<number>();
 	const existing = (id: number) => {
 		const row = caseById(db, id);
 		if (!row) throw notFound(`case ${id}`);
+		referencedFolders.add(row.folder);
 		folder(index.path(row.folder));
 		folder(after.path(placed.get(id) ?? row.folder));
 		tags(json<string[]>(row.tags));
@@ -1060,6 +1191,28 @@ export function* scopeFactsSteps(
 			}
 		}
 	}
+	if (refusal) {
+		const scopes = yield* refusedFolderScopesSteps(index, edits, referencedFolders);
+		if (scopes === null) {
+			// The graph can encode exponentially many paths. Include every folder condition in either policy
+			// so clauseFor can combine all possible matches without enumerating those paths.
+			for (const policy of [currentPolicy(db, project), adoptionPolicy(db, project, edits)])
+				for (const clause of policy.clauses)
+					for (const predicate of clause.when) if (predicate.startsWith("folder:")) folder(predicate.slice(7));
+			for (const row of index.byId.values()) {
+				folder(index.path(row.id));
+				for (const tagged of db.all(Q.folderCaseTags, { project, folder: row.id })) tags(json<string[]>(tagged.tags));
+				yield;
+			}
+		} else {
+			for (const [id, paths] of scopes) {
+				for (const path of paths) folder(path);
+				if (index.byId.has(id))
+					for (const row of db.all(Q.folderCaseTags, { project, folder: id })) tags(json<string[]>(row.tags));
+				yield;
+			}
+		}
+	}
 	return [...facts];
 }
 
@@ -1101,7 +1254,7 @@ export function* adoptSteps(ctx: Ctx, witness: Witness, proposal: ProposalRow): 
 	const edits = resolvedOf(proposal);
 	const index = folderIndex(ctx.db, ctx.project.id);
 	const folders = yield* projectFoldersSteps(index, edits);
-	if (folders.refusal) throw invalid(folders.refusal);
+	if (folders.refusal) throw invalid(folders.refusal.message);
 	validateFolderPaths(index, folders);
 	const policy = adoptionPolicy(ctx.db, ctx.project.id, edits);
 	const stamp = (row: CaseRow, version: number, hash: string) => {

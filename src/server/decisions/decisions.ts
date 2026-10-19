@@ -1970,7 +1970,14 @@ function* factsNowSteps(db: Db, question: QuestionRow): Generator<undefined, Set
 		const subject = json<{ proposal: number }>(question.subject);
 		const proposal = proposalById(db, subject.proposal);
 		if (proposal) {
-			for (const fact of facts) if (fact.startsWith("folder:") || fact.startsWith("tag:")) facts.delete(fact);
+			for (const fact of facts)
+				if (
+					fact.startsWith("folder:") ||
+					fact.startsWith("tag:") ||
+					fact.startsWith("refused:") ||
+					fact === "replay:refused"
+				)
+					facts.delete(fact);
 			for (const fact of yield* scopeFactsSteps(db, question.project, resolvedOf(proposal))) facts.add(fact);
 		}
 	}
@@ -2032,7 +2039,12 @@ function itemOf(db: Db, row: QuestionRow, facts: ReadonlySet<string>, ask: Ask):
 		evidence: row.kind === "failure" ? { ...stored, hints, facts: [...facts] } : stored,
 		evidenceHash: row.evidence_hash,
 		seen: { count: row.seen_count, carried: row.carried },
-		needs: describeAsk(ask),
+		needs: [
+			describeAsk(ask),
+			...[...facts]
+				.filter((fact) => fact.startsWith("refused:"))
+				.map((fact) => `accepting refused: ${fact.slice("refused:".length)}`),
+		].join("; "),
 		answers: applicableAnswers(row.kind, facts),
 		blocks: json<number[]>(row.blocks).flatMap((id) => {
 			const run = runById(db, id);

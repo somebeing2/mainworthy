@@ -1,6 +1,6 @@
 // The project's policy: a versioned clause table. Owns the table `policies`.
 // Reading is open to every module; the only writer is the effect of an `adopt` decision (see suite/adopt).
-import { type Clause, clauseOf, type Facts, Policy, type Unlinked } from "../../core/kinds.ts";
+import { type Ask, type Clause, clauseOf, type Facts, Policy, type Unlinked } from "../../core/kinds.ts";
 import { PRESETS, type PresetName, policyProblem, presetOf, storedPolicy } from "../../core/presets.ts";
 import type { Ctx } from "../kernel/ctx.ts";
 import { type Db, sql } from "../kernel/db.ts";
@@ -63,7 +63,7 @@ export const policySummary = (policy: Policy): { policy: string; unlinked: Unlin
 	unlinked: policy.settings.unlinked,
 });
 
-/** The clause that owns a question. A policy is checked for totality when written, so this always finds one. */
+/** The owning clause, or combined review requirements when a refused replay has several possible matches. */
 export function clauseFor(policy: Policy, facts: Facts): Clause {
 	if (facts.kind === "adopt" && facts.facts.has("quarantine"))
 		return {
@@ -75,7 +75,22 @@ export function clauseFor(policy: Policy, facts: Facts): Clause {
 		};
 	const clause = clauseOf(policy, facts);
 	if (!clause) throw new Error(`policy ${policy.preset} has no clause for a ${facts.kind} question`);
-	return clause;
+	if (!facts.facts.has("replay:refused") || facts.kind !== "adopt") return clause;
+	// Scope facts cover every resolution, but their union can select an earlier, looser clause. Combine every
+	// possible match until a match independent of those scopes makes all later clauses unreachable.
+	const ask: Ask = { ...clause.ask, who: clause.ask.who === "rule" ? "member" : clause.ask.who, agents: "none" };
+	for (const candidate of policy.clauses) {
+		if (!clauseOf({ clauses: [candidate], settings: policy.settings }, facts)) continue;
+		const who = candidate.ask.who === "rule" ? "member" : candidate.ask.who;
+		if (ask.who !== who) {
+			if (ask.who === "member" && who.startsWith("role:")) ask.who = who;
+			else if (!(who === "member" && ask.who.startsWith("role:"))) ask.who = "admin";
+		}
+		ask.notProducer ||= candidate.ask.notProducer;
+		if (candidate.ask.reason === "required") ask.reason = "required";
+		if (candidate.when.every((predicate) => !predicate.startsWith("folder:") && !predicate.startsWith("tag:"))) break;
+	}
+	return { id: "refused-replay", kind: "adopt", when: ["always"], blocks: clause.blocks, ask };
 }
 
 export const isPreset = (name: string): name is PresetName => name in PRESETS;

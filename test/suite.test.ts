@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,8 @@ import { parseCase } from "../src/core/markdown.ts";
 import { applyMergeChoice, type Conflict } from "../src/core/merge3.ts";
 import { CaseBody, type ConflictAddress, emptyBody } from "../src/core/model.ts";
 import { type DecideReply, type Edit, ProposeReply } from "../src/core/ops.ts";
+import { PRESETS } from "../src/core/presets.ts";
+import { actorByName } from "../src/server/identity/identity.ts";
 import { defaultConfig } from "../src/server/kernel/app.ts";
 import { Db } from "../src/server/kernel/db.ts";
 import { ARCHIVE_VERSION } from "../src/server/kernel/migrate.ts";
@@ -914,6 +916,419 @@ describe("capture", () => {
 			},
 		});
 		expect(h.call("find", { folder: "Checkout" })).toMatchObject({ count: 1, items: [{ ref: "C-1" }] });
+	});
+
+	test.each([
+		["move", "inbox"],
+		["move", "read"],
+		["move", "accept"],
+		["create", "inbox"],
+		["create", "read"],
+		["create", "accept"],
+		["place", "inbox"],
+		["place", "read"],
+		["place", "accept"],
+	] as const)("a stored %s proposal handles %s when its target becomes ambiguous during replay", (op, action) => {
+		h.call("propose", {
+			edits: [
+				{ op: "create", outline: "First", folder: "Source" },
+				{ op: "create", outline: "Second", folder: "Moving" },
+			],
+		});
+		const agent = h.actor("writer", "agent", ["read", "produce"]);
+		h.call("propose", { edits: [{ op: "policy", preset: "standard" }] });
+		const policy = h.call<{ items: { q: string; evidenceHash: string }[] }>("inbox", { kind: "adopt" }).items[0];
+		if (!policy) throw new Error("no policy question");
+		h.call("decide", { q: policy.q, onEvidence: policy.evidenceHash, answer: { is: "accept" } });
+		const target: Edit =
+			op === "move"
+				? { op: "folder", folder: "Moving", parent: "Target" }
+				: op === "create"
+					? { op: "create", outline: "New case", folder: "Target/New" }
+					: { op: "place", cases: ["C-2"], folder: "Target/New" };
+		const pending = h.call<Proposed>(
+			"propose",
+			{
+				edits: [
+					{ op: "folder", folder: "Source", name: "Target" },
+					{ op: "folder", folder: "Moving", archive: false },
+					target,
+					{ op: "folder", folder: "Source", name: "Finished" },
+				],
+			},
+			agent,
+		);
+		const question = h.call<{ items: { q: string; evidenceHash: string }[] }>("inbox", { kind: "adopt" }).items[0];
+		if (!question) throw new Error("no folder question");
+		expect(pending).toMatchObject({ status: "open", question: question.q });
+		h.call("propose", { edits: [{ op: "folder", folder: "Moving", name: "Target" }] });
+		const ambiguity = 'folder path "Target" is ambiguous during the proposal; reorder the folder edits';
+		if (action === "accept")
+			expect(
+				h.call("decide", { q: question.q, onEvidence: question.evidenceHash, answer: { is: "accept" } }),
+			).toMatchObject([{ status: "invalid", needs: ambiguity }]);
+		else if (action === "inbox")
+			expect(h.call("inbox", { kind: "adopt" })).toMatchObject({
+				items: [
+					{ q: question.q, state: "open", needs: `one member who is not an agent; accepting refused: ${ambiguity}` },
+				],
+			});
+		else
+			expect(h.call("get", { refs: [question.q] })).toMatchObject([
+				{ q: question.q, state: "open", needs: `one member who is not an agent; accepting refused: ${ambiguity}` },
+			]);
+		expect(h.call<CaseView[]>("get", { refs: ["C-1", "C-2"] }).map((row) => row.folder.path)).toEqual([
+			"Source",
+			"Target",
+		]);
+		expect(
+			h.call<{ status: string }[]>("decide", {
+				q: question.q,
+				onEvidence: question.evidenceHash,
+				answer: { is: "reject" },
+			})[0]?.status,
+		).toBe("decided");
+	});
+
+	test.each([
+		["ambiguity", "folder:secure"],
+		["self-move", "folder:secure"],
+		["ambiguity", "folder:b/secure"],
+		["self-move", "folder:a/b/secure"],
+		["ambiguity", "tag:guarded"],
+		["self-move", "tag:guarded"],
+		["ambiguity", "folder:fin/n"],
+		["ambiguity", "folder:other/n"],
+		["ambiguity", "folder:other/n/fin/n"],
+		["ambiguity", "folder:fin/n/old"],
+	] as const)(
+		"a refused %s replay keeps policy facts for %s from later edits and every candidate",
+		(refusal, scope) => {
+			h.call("propose", {
+				edits: ["A", "B", "C", "Secure", "C/Sub", ...(scope === "folder:fin/n/old" ? ["A/N"] : [])].map(
+					(folder, i) => ({
+						op: "create",
+						outline: `Case ${i}${folder === "Secure" ? " #guarded" : ""}`,
+						folder,
+					}),
+				),
+			});
+			h.actor("approver", "human", ["read", "produce", "answer"]);
+			h.call("admin", {
+				do: "grant.set",
+				actor: "approver",
+				project: "scratch",
+				can: ["read", "produce", "answer"],
+				roles: ["approver"],
+			});
+			const approver = actorByName(h.app.db, "approver", 1);
+			if (!approver) throw new Error("no approver");
+			const clauses = [...PRESETS.standard.clauses];
+			clauses.splice(
+				clauses.findIndex((clause) => clause.id === "adopt-agent"),
+				0,
+				{
+					id: "review-scope",
+					kind: "adopt",
+					when: ["author:agent", scope],
+					ask: { who: "role:approver", agents: "none", notProducer: false, reason: "required" },
+					blocks: "nothing",
+				},
+			);
+			h.call("propose", { edits: [{ op: "policy", base: 1, clauses }] });
+			const policy = h.call<{ items: { q: string; evidenceHash: string }[] }>("inbox", { kind: "adopt" }).items[0];
+			if (!policy) throw new Error("no policy question");
+			h.call("decide", { q: policy.q, onEvidence: policy.evidenceHash, answer: { is: "accept" } });
+			const agent = h.actor("writer", "agent", ["read", "produce"]);
+			const pending = h.call<Proposed>(
+				"propose",
+				{
+					edits: [
+						refusal === "ambiguity"
+							? { op: "folder", folder: "A", name: "X" }
+							: { op: "folder", folder: "A", parent: "B" },
+						{ op: "create", outline: "New case", folder: "X/N" },
+						{ op: "folder", folder: "Secure", parent: "B" },
+						...(scope === "folder:fin/n/old"
+							? ([
+									{ op: "folder", folder: "A/N", name: "Old" },
+									{ op: "create", outline: "Recreated child", folder: "X/N" },
+									{ op: "folder", folder: "A/N", parent: "X/N" },
+								] satisfies Edit[])
+							: []),
+						{ op: "folder", folder: "A", name: "Fin" },
+						...(scope === "folder:other/n/fin/n"
+							? ([
+									{ op: "create", outline: "Other candidate", folder: "X/N" },
+									{ op: "folder", folder: "A", parent: "X/N" },
+								] satisfies Edit[])
+							: []),
+						...(scope.startsWith("folder:other/")
+							? ([{ op: "folder", folder: "C", name: "Other" }] satisfies Edit[])
+							: []),
+					],
+				},
+				agent,
+			);
+			const ask = "a member with role approver who is not an agent with a reason";
+			expect(h.call("get", { refs: [pending.question] })).toMatchObject([
+				{
+					needs:
+						scope === "folder:other/n" || scope === "folder:other/n/fin/n" || scope === "folder:a/b/secure"
+							? "one member who is not an agent"
+							: ask,
+				},
+			]);
+			h.call("propose", {
+				edits: [
+					refusal === "ambiguity"
+						? { op: "folder", folder: "C", name: "X" }
+						: { op: "folder", folder: "B", parent: "A" },
+				],
+			});
+			const needs =
+				refusal === "ambiguity"
+					? `${ask}; accepting refused: folder path "X" is ambiguous during the proposal; reorder the folder edits`
+					: ask;
+			expect(h.call("get", { refs: [pending.question] })).toMatchObject([{ state: "open", needs }]);
+			const question = h
+				.call<{ items: { q: string; evidenceHash: string; needs: string }[] }>("inbox", { kind: "adopt" })
+				.items.find((item) => item.q === pending.question);
+			if (!question) throw new Error("no folder question");
+			expect(question.needs).toBe(needs);
+			const member = h.actor("plain", "human", ["read", "produce", "answer"]);
+			expect(
+				h.call("decide", { q: question.q, onEvidence: question.evidenceHash, answer: { is: "reject" } }, member),
+			).toMatchObject([{ status: "forbidden", needs: ask }]);
+			expect(
+				h.call("decide", { q: question.q, onEvidence: question.evidenceHash, answer: { is: "reject" } }, approver),
+			).toMatchObject([{ status: "invalid", needs: "a reason" }]);
+			expect(
+				h.call(
+					"decide",
+					{ q: question.q, onEvidence: question.evidenceHash, answer: { is: "reject" }, reason: "No longer needed" },
+					approver,
+				),
+			).toMatchObject([{ status: "decided" }]);
+		},
+	);
+
+	test.each([
+		["union", "member"],
+		["union", "rule"],
+		["union", "role:auditor"],
+		["union", "author"],
+		["budget", "member"],
+		["budget", "rule"],
+	] as const)("a refused %s replay cannot select an earlier looser %s clause", (shape, who) => {
+		const chain = Array.from({ length: 16 }, (_, i) => `L${i}`);
+		h.call("propose", {
+			edits: ["A", "C", ...(shape === "budget" ? [chain.join("/")] : [])].map((folder) => ({
+				op: "create",
+				outline: folder,
+				folder,
+			})),
+		});
+		h.actor("approver", "human", ["read", "produce", "answer"]);
+		h.call("admin", {
+			do: "grant.set",
+			actor: "approver",
+			project: "scratch",
+			can: ["read", "produce", "answer"],
+			roles: ["approver"],
+		});
+		const approver = actorByName(h.app.db, "approver", 1);
+		if (!approver) throw new Error("no approver");
+		if (who === "role:auditor") {
+			h.actor("auditor", "human", ["read", "produce", "answer"]);
+			h.call("admin", {
+				do: "grant.set",
+				actor: "auditor",
+				project: "scratch",
+				can: ["read", "produce", "answer"],
+				roles: ["auditor"],
+			});
+		}
+		const clauses = [...PRESETS.standard.clauses];
+		clauses.splice(
+			clauses.findIndex((clause) => clause.id === "adopt-agent"),
+			1,
+			{
+				id: "looser-folder",
+				kind: "adopt",
+				when: shape === "budget" ? ["folder:sandbox"] : ["folder:fin/n", "folder:other/n"],
+				ask: { who, agents: "answer", notProducer: false, reason: "optional" },
+				...(who === "rule" ? { answer: { is: "reject" } } : {}),
+				blocks: "nothing",
+			},
+			{
+				id: "stricter-catch-all",
+				kind: "adopt",
+				when: ["author:agent"],
+				ask: { who: "role:approver", agents: "none", notProducer: false, reason: "required" },
+				blocks: "nothing",
+			},
+		);
+		h.call("propose", { edits: [{ op: "policy", base: 1, clauses }] });
+		const policy = h.call<{ items: { q: string; evidenceHash: string }[] }>("inbox", { kind: "adopt" }).items[0];
+		if (!policy) throw new Error("no policy question");
+		h.call("decide", { q: policy.q, onEvidence: policy.evidenceHash, answer: { is: "accept" } });
+		const edits: Edit[] = [
+			{ op: "folder", folder: "A", name: "X" },
+			{ op: "create", outline: "New case", folder: "X/N" },
+			...(shape === "budget"
+				? chain.map(
+						(name, i): Edit => ({
+							op: "folder",
+							folder: chain.slice(0, i + 1).join("/"),
+							name: `${name}a`,
+						}),
+					)
+				: []),
+			{ op: "folder", folder: "A", name: "Fin" },
+			...(shape === "union" ? ([{ op: "folder", folder: "C", name: "Other" }] satisfies Edit[]) : []),
+		];
+		const agent = h.actor("writer", "agent", ["read", "produce", "answer"]);
+		const pending = h.call<Proposed>("propose", { edits }, agent);
+		expect(pending.status).toBe("open");
+		h.call("propose", { edits: [{ op: "folder", folder: "C", name: "X" }] });
+		const question = h.call<{ items: { q: string; evidenceHash: string }[] }>("inbox", { kind: "adopt" }).items[0];
+		if (!question) throw new Error("no folder question");
+		const member = h.actor("plain", "human", ["read", "produce", "answer"]);
+		const incompatible = who === "role:auditor" || who === "author";
+		const ask = incompatible
+			? "an admin who is not an agent with a reason"
+			: "a member with role approver who is not an agent with a reason";
+		expect(
+			h.call("decide", { q: question.q, onEvidence: question.evidenceHash, answer: { is: "reject" } }, member),
+		).toMatchObject([{ status: "forbidden", needs: ask }]);
+		expect(h.call("get", { refs: [pending.question] })).toMatchObject([
+			{
+				state: "open",
+				needs: `${ask}; accepting refused: folder path "X" is ambiguous during the proposal; reorder the folder edits`,
+			},
+		]);
+		expect(
+			h.call("decide", { q: question.q, onEvidence: question.evidenceHash, answer: { is: "reject" } }, agent),
+		).toMatchObject([{ status: "forbidden", needs: ask }]);
+		expect(
+			h.call("decide", { q: question.q, onEvidence: question.evidenceHash, answer: { is: "reject" } }, approver),
+		).toMatchObject([incompatible ? { status: "forbidden", needs: ask } : { status: "invalid", needs: "a reason" }]);
+		h.call("propose", { edits: [{ op: "folder", folder: "X", name: "Elsewhere" }] });
+		expect(h.call("get", { refs: [pending.question] })).toMatchObject([
+			{ state: "open", needs: "a member with role approver who is not an agent with a reason" },
+		]);
+		h.call("propose", { edits: [{ op: "folder", folder: "Elsewhere", name: "X" }] });
+		expect(
+			h.call(
+				"decide",
+				{ q: question.q, onEvidence: question.evidenceHash, answer: { is: "reject" }, reason: "No longer needed" },
+				incompatible ? undefined : approver,
+			),
+		).toMatchObject([{ status: "decided" }]);
+	});
+
+	test.each([
+		["wide", 0, ""],
+		["deep", 16, "a"],
+		["deep", 12, "ab"],
+	] as const)("a refused %s replay bounds candidate work at depth %i with renames %s", (shape, depth, names) => {
+		const chain = Array.from({ length: depth }, (_, i) => `L${i}`);
+		const edits: Edit[] = [{ op: "folder", folder: "S", name: "X" }];
+		let scope: string;
+		if (shape === "wide") {
+			h.call("propose", {
+				edits: Array.from({ length: 200 }, (_, i) => ({
+					op: "create",
+					outline: `Case ${i} #guarded`,
+					folder: `F${i % 50}/G${i}`,
+				})),
+			});
+			edits[0] = { op: "folder", folder: "F0", name: "X" };
+			for (let i = 0; i < 998; i++) {
+				if (i % 4 === 0) edits.push({ op: "create", outline: `N${i}`, folder: `X/N${i}` });
+				else if (i % 4 === 1) edits.push({ op: "place", cases: [`C-${1 + (i % 200)}`], folder: `X/P${i % 50}` });
+				else if (i % 4 === 2) edits.push({ op: "folder", name: `M${i}`, parent: `X/N${i - 2}` });
+				else edits.push({ op: "folder", folder: `F${1 + (i % 49)}/G${1 + (i % 49)}`, name: `R${i}` });
+			}
+			edits.push({ op: "folder", folder: "F0", name: "Fin" });
+			scope = "folder:fin/n0/m2";
+		} else {
+			h.call("propose", {
+				edits: [
+					{ op: "create", outline: "Deep #guarded", folder: chain.join("/") },
+					{ op: "create", outline: "Source", folder: "S" },
+				],
+			});
+			edits.push({ op: "create", outline: "T", folder: "X/N" });
+			for (let i = 0; i < chain.length; i++)
+				for (const name of names)
+					edits.push({ op: "folder", folder: chain.slice(0, i + 1).join("/"), name: `${chain[i]}${name}` });
+			edits.push({ op: "create", outline: "Deep2", folder: "X/N/Q" }, { op: "folder", folder: "S", name: "Fin" });
+			scope = `folder:${chain
+				.map((name) => `${name}${names.at(-1)}`)
+				.join("/")
+				.toLowerCase()}`;
+		}
+		const clauses = [...PRESETS.standard.clauses];
+		h.actor("approver", "human", ["read", "produce", "answer"]);
+		h.call("admin", {
+			do: "grant.set",
+			actor: "approver",
+			project: "scratch",
+			can: ["read", "produce", "answer"],
+			roles: ["approver"],
+		});
+		clauses.splice(
+			clauses.findIndex((clause) => clause.id === "adopt-agent"),
+			0,
+			{
+				id: "deep-review",
+				kind: "adopt",
+				when: ["author:agent", scope, "tag:guarded"],
+				ask: { who: "role:approver", agents: "none", notProducer: false, reason: "required" },
+				blocks: "nothing",
+			},
+		);
+		h.call("propose", { edits: [{ op: "policy", base: 1, clauses }] });
+		const policy = h.call<{ items: { q: string; evidenceHash: string }[] }>("inbox", { kind: "adopt" }).items[0];
+		if (!policy) throw new Error("no policy question");
+		h.call("decide", { q: policy.q, onEvidence: policy.evidenceHash, answer: { is: "accept" } });
+		const agent = h.actor("writer", "agent", ["read", "produce"]);
+		const pending = h.call<Proposed>("propose", { edits }, agent);
+		expect(pending.status).toBe("open");
+		h.call("propose", { edits: [{ op: "folder", name: "X" }] });
+		// Count actual path candidates, including duplicates, rather than elapsed time on a shared machine.
+		const add = Set.prototype.add;
+		let candidates = 0;
+		const limit = 25_000 + 100 * edits.length;
+		const spy = spyOn(Set.prototype, "add").mockImplementation(function (this: Set<unknown>, value: unknown) {
+			if (typeof value === "string" && value.includes("/")) {
+				candidates++;
+				if (candidates === limit + 1) throw new Error("candidate work exceeded its polynomial bound");
+			}
+			return add.call(this, value);
+		});
+		let reply: Reply;
+		try {
+			reply = h.raw("inbox", { kind: "adopt" });
+		} finally {
+			spy.mockRestore();
+		}
+		expect(candidates).toBeLessThanOrEqual(limit);
+		expect(reply).toMatchObject({
+			ok: true,
+			result: {
+				items: [
+					{
+						q: pending.question,
+						state: "open",
+						needs:
+							'a member with role approver who is not an agent with a reason; accepting refused: folder path "X" is ambiguous during the proposal; reorder the folder edits',
+					},
+				],
+			},
+		});
 	});
 
 	test.each(["\u200b", " \u200b "])("a folder name empty after cleaning is refused: %s", (name) => {
