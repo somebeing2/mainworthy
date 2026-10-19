@@ -50,9 +50,37 @@ type PendingAttachment = AttachmentInput & { key: string };
 type RecordedResult = { fill: Fill; previous: Fill | null };
 type LastResult = { slot: Slot; outcome: RunOutcome; ready: Promise<RecordedResult> };
 
+const fallbackCockpitLifecycles = new Map<string, number>();
+
+function cockpitLifecycle(project: string, runRef: string, actorId: string): number {
+	const key = `mainworthy-cockpit:${project}:${runRef}:${actorId}`;
+	try {
+		const next = Number(sessionStorage.getItem(key) ?? "0") + 1;
+		sessionStorage.setItem(key, String(next));
+		return next;
+	} catch {
+		const next = (fallbackCockpitLifecycles.get(key) ?? 0) + 1;
+		fallbackCockpitLifecycles.set(key, next);
+		return next;
+	}
+}
+
+function currentCockpitLifecycle(project: string, runRef: string, actorId: string): number | null {
+	const key = `mainworthy-cockpit:${project}:${runRef}:${actorId}`;
+	try {
+		const value = sessionStorage.getItem(key);
+		return value === null ? null : Number(value);
+	} catch {
+		return fallbackCockpitLifecycles.get(key) ?? null;
+	}
+}
+
 export function RunCockpit({ runRef }: { runRef: string }) {
 	const { project, session, setStatus } = useApp();
 	const owner = useRef(deviceSession()).current;
+	const [lifecycle] = useState(() => cockpitLifecycle(project, runRef, String(owner.actorId)));
+	const executionSequence = useRef(0);
+	const slotSequences = useRef(new Map<number, number>());
 	const runRead = useQueryOp({ project, op: "get", input: { refs: [runRef] } });
 	const parsedRun = Run.safeParse(runRead.data?.[0]);
 	const run = parsedRun.success && parsedRun.data.ref === runRef ? parsedRun.data : null;
@@ -154,6 +182,11 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 	const withdrawn = useRef(new Set<Promise<RecordedResult>>());
 	const latest = useRef(new Map<number, Fill>());
 	const queued = useRef(new Map<number, number>());
+	const currentLifecycle = () =>
+		currentCockpitLifecycle(project, runRef, String(owner.actorId)) === lifecycle && sessionCurrent(owner);
+	const currentSlotExecution = (slotId: number, sequence: number) =>
+		currentLifecycle() && slotSequences.current.get(slotId) === sequence;
+	const currentExecution = (sequence: number) => currentLifecycle() && executionSequence.current === sequence;
 	const method = session.kind === "agent" ? "agent" : "human";
 	const slots: Slot[] = storedSlots.map((slot) => {
 		const own = local.get(slot.id);
@@ -335,6 +368,9 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 		if (!restores) consumedSteps.current.set(slot.id, marked);
 		const priorWrite = writes.current.get(slot.id);
 		const rollback = confirmedSlots.current.get(slot.id) ?? slot;
+		const sequence = (slotSequences.current.get(slot.id) ?? 0) + 1;
+		slotSequences.current.set(slot.id, sequence);
+		const execution = ++executionSequence.current;
 		queued.current.set(slot.id, fill.result);
 		const request = (async () => {
 			if (priorWrite) await priorWrite.catch(() => undefined);
@@ -403,12 +439,13 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 			};
 			const complete = (receipt: ReportReceipt): RecordedResult => {
 				if (!sessionCurrent(owner)) throw new Error("The session changed. Your note is kept.");
-				uncertain.current.delete(slot.id);
 				if (receipt.rejected.length || receipt.declined?.length || !receipt.results[0])
 					throw new Error(
 						receipt.rejected[0]?.reason ?? receipt.declined?.[0]?.reason ?? "The result was not recorded.",
 					);
 				const saved = { ...fill, outcome, note: text || null, result: receipt.results[0], atStep: atStep ?? null };
+				if (!currentSlotExecution(slot.id, sequence)) return { fill: saved, previous };
+				uncertain.current.delete(slot.id);
 				latest.current.set(slot.id, saved);
 				if (files.length) {
 					for (const file of files) consumedFiles.current.delete(file);
@@ -426,9 +463,10 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 					setLocal((value) =>
 						new Map(value).set(slot.id, { fill: saved, questions: receipt.questions, pending: false }),
 					);
-				setStatus(
-					`${slot.case} ${outcome} recorded on pinned version ${slot.version}${receipt.questions[0] ? ` · ${receipt.questions[0].q}: ${receipt.questions[0].how}` : ""}.`,
-				);
+				if (currentExecution(execution))
+					setStatus(
+						`${slot.case} ${outcome} recorded on pinned version ${slot.version}${receipt.questions[0] ? ` · ${receipt.questions[0].q}: ${receipt.questions[0].how}` : ""}.`,
+					);
 				void invalidateProject(project);
 				return { fill: saved, previous };
 			};
@@ -468,7 +506,7 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 		})();
 		writes.current.set(slot.id, request);
 		void request.catch((error: unknown) => {
-			if (!sessionCurrent(owner)) return;
+			if (!currentSlotExecution(slot.id, sequence)) return;
 			for (const file of files) consumedFiles.current.delete(file);
 			if (consumedNotes.current.get(slot.id) === text) consumedNotes.current.delete(slot.id);
 			if (consumedSteps.current.get(slot.id) === marked) consumedSteps.current.delete(slot.id);
@@ -492,10 +530,11 @@ export function RunCockpit({ runRef }: { runRef: string }) {
 			});
 			setLast((value) => (value?.ready === request ? null : value));
 			// The person may already be typing another note. Restore the slot without changing their selection or input.
-			setStatus(
-				uncertain.current.get(slot.id)?.message ??
-					`${slot.case} was not recorded: ${error instanceof Error ? error.message : "The request failed"}. Its note is kept. Return to the slot to retry.`,
-			);
+			if (currentExecution(execution))
+				setStatus(
+					uncertain.current.get(slot.id)?.message ??
+						`${slot.case} was not recorded: ${error instanceof Error ? error.message : "The request failed"}. Its note is kept. Return to the slot to retry.`,
+				);
 			void invalidateProject(project);
 		});
 		if (advance) {

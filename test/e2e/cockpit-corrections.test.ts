@@ -244,3 +244,45 @@ check(
 	},
 	30_000,
 );
+
+check(
+	"a stale failure cannot replace a newer pass status (stale cockpit execution)",
+	async () => {
+		const { server, path } = await fixture(2);
+		let view: Awaited<ReturnType<typeof openPage>> | null = null;
+		const held = Promise.withResolvers<void>();
+		const sent = Promise.withResolvers<void>();
+		try {
+			view = await openPage(server, { path });
+			const { page } = view;
+			await ready(page);
+			let heldFailure = false;
+			await page.route("**/report", async (route) => {
+				const input = z
+					.object({ results: z.array(z.object({ outcome: z.string() })) })
+					.parse(route.request().postDataJSON());
+				if (input.results[0]?.outcome !== "fail" || heldFailure) return route.continue();
+				heldFailure = true;
+				sent.resolve();
+				await held.promise;
+				await route.abort();
+			});
+			await fail(page, "The stale failure");
+			await sent.promise;
+			await page.keyboard.press("j");
+			await page.keyboard.press("p");
+			await page.locator("#stat").filter({ hasText: "C-2 pass recorded" }).waitFor();
+			held.resolve();
+			await eventually(
+				() => page.locator("#stat").innerText(),
+				(text) => text.includes("C-2 pass recorded") && !text.includes("C-1 was not recorded"),
+			);
+			expect(await page.locator("#stat").innerText()).toContain("C-2 pass recorded");
+		} finally {
+			held.resolve();
+			await view?.close();
+			await server.stop();
+		}
+	},
+	30_000,
+);
