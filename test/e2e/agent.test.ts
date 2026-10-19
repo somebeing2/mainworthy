@@ -110,6 +110,10 @@ for (const surface of ["case", "queue"] as const)
 						path: surface === "case" ? "/p/scratch/suite/c/1" : `/p/scratch/queue/${proposed.question.slice(2)}`,
 					});
 					const { page } = view;
+					const painted = () =>
+						page.evaluate(
+							() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))),
+						);
 					if (device === "desktop") await page.setViewportSize({ width: 1280, height: 800 });
 					const evidence = page.locator(`[data-proposal-evidence="${proposed.question}"][data-proposal-loaded="true"]`);
 					await evidence.waitFor();
@@ -122,11 +126,12 @@ for (const surface of ["case", "queue"] as const)
 						element.scrollTop = element.scrollHeight;
 					});
 					await page.keyboard.press("r");
+					await painted();
 					expect((await server.api("get", { refs: [proposed.question] }))[0]?.state).toBe("open");
 					let pages = 0;
 					while ((await evidence.getAttribute("data-proposal-read")) !== "ready" && pages++ < 40) {
 						await page.keyboard.press("r");
-						await page.waitForTimeout(50);
+						await painted();
 						expect((await server.api("get", { refs: [proposed.question] }))[0]?.state).toBe("open");
 					}
 					expect(await evidence.getAttribute("data-proposal-read")).toBe("ready");
@@ -325,10 +330,13 @@ for (const surface of ["case", "queue"] as const)
 					const frame = element.closest(".pane-scroll")?.getBoundingClientRect();
 					return frame !== undefined && box.top >= frame.top - 1 && box.bottom <= frame.bottom + 1;
 				});
-			// The whole of the proposal does not fit under six steps at 1280 by 800: the first press only shows it.
+			// The title edit fits once revealed, but revealing it cannot count it as already read.
+			await view.page.locator(`[data-proposal-evidence="${proposed.question}"][data-proposal-loaded="true"]`).waitFor();
 			expect(await inView()).toBe(false);
 			await view.page.keyboard.press("a");
-			await view.page.getByText("is now in view", { exact: false }).waitFor();
+			await view.page
+				.getByText(`${proposed.question} has unread edits. Read the next part, then press a again.`, { exact: true })
+				.waitFor();
 			expect(await inView()).toBe(true);
 			expect((await server.api("get", { refs: ["C-1"] }))[0]?.version).toBe(1);
 			expect((await server.api("inbox", { kind: "adopt" })).items.map((q) => q.q)).toEqual([proposed.question ?? ""]);

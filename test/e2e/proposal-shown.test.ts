@@ -106,6 +106,104 @@ const partCoverage = async (page: Page) =>
 
 for (const device of ["desktop", "phone"] as const)
 	t(
+		`${device} short case window pages on every answer press without moving the outer pane`,
+		async () => {
+			const server = await startServer({ preset: "standard", seed: false });
+			let view: Awaited<ReturnType<typeof openPage>> | null = null;
+			try {
+				await server.api("propose", { edits: [{ op: "create", outline: "Original case" }] });
+				const token = await agentToken(server);
+				const proposed = await server.api(
+					"propose",
+					{
+						edits: [
+							{ op: "edit", case: "C-1", base: 1, body: { title: "Changed case" } },
+							...Array.from({ length: 20 }, (_, i) => ({ op: "create" as const, outline: `Extra case ${i}` })),
+						],
+					},
+					{ token },
+				);
+				const q = proposed.question ?? "";
+				view = await openPage(server, {
+					path: "/p/scratch/suite/c/1",
+					device,
+					setup: async (page) => {
+						await page.setViewportSize(device === "phone" ? { width: 390, height: 360 } : { width: 1100, height: 420 });
+						await trackPartCoverage(page, q);
+					},
+				});
+				const { page } = view;
+				const evidence = page.locator(`[data-proposal-evidence="${q}"]`);
+				await page.locator(`[data-proposal-evidence="${q}"][data-proposal-loaded="true"]`).waitFor();
+				if (device === "phone") {
+					// Wider system fonts wrap the paging status and reduce the height left for the card.
+					await page.locator("#bar").evaluate((bar) => {
+						bar.style.fontFamily = "monospace";
+					});
+				}
+				await page.keyboard.press("r");
+				await frames(page);
+				const pane = page.locator(".pane-scroll");
+				const cardHeight = await page
+					.locator(`[data-proposal="${q}"]`)
+					.evaluate((card) => card.getBoundingClientRect().height);
+				if (device === "desktop")
+					expect(await pane.evaluate((element) => element.clientHeight)).toBeGreaterThan(cardHeight + 8);
+				const outerTop = await pane.evaluate((element) => element.scrollTop);
+				for (
+					let presses = 0;
+					presses < 60 && (await evidence.getAttribute("data-proposal-read")) !== "ready";
+					presses++
+				) {
+					const before = await evidence.evaluate((element) => element.scrollTop);
+					if (presses === 1) {
+						await pane.evaluate((element) => {
+							element.scrollTop = 0;
+						});
+						await frames(page);
+						const cardTop = await page
+							.locator(`[data-proposal="${q}"]`)
+							.evaluate((card) => card.getBoundingClientRect().top);
+						expect(cardTop).toBeGreaterThanOrEqual(
+							await pane.evaluate((element) => element.getBoundingClientRect().bottom),
+						);
+					}
+					await page.keyboard.press("r");
+					await frames(page);
+					expect(await pane.evaluate((element) => element.scrollTop)).toBeCloseTo(outerTop, 0);
+					expect(await evidence.evaluate((element) => element.scrollTop)).toBeGreaterThan(before);
+					expect(await openAdopt(server)).toEqual([q]);
+					if (device === "phone") {
+						expect(await page.locator("#bar").evaluate((bar) => bar.clientHeight)).toBeGreaterThan(28);
+						expect(await pane.evaluate((element) => element.clientHeight)).toBeLessThan(cardHeight);
+					}
+				}
+				expect(await evidence.getAttribute("data-proposal-read")).toBe("ready");
+				expect(await partCoverage(page)).toEqual({ parts: 42, unseen: 0 });
+				await pane.evaluate((element) => {
+					element.scrollTop = 0;
+				});
+				await frames(page);
+				await page.keyboard.press("r");
+				await frames(page);
+				expect(await openAdopt(server)).toEqual([q]);
+				expect(await page.locator("#stat").innerText()).toBe(`${q} is now in view. Read it, then press r again.`);
+				const response = page.waitForResponse((reply) => reply.url().endsWith("/decide"));
+				await page.keyboard.press("r");
+				await response;
+				expect((await server.api("get", { refs: [q] }))[0]?.decision).toMatchObject({ answer: { is: "reject" } });
+				expect((await server.api("get", { refs: ["C-1"] }))[0]).toMatchObject({ title: "Original case", version: 1 });
+				expect(view.errors).toEqual([]);
+			} finally {
+				await view?.close();
+				await server.stop();
+			}
+		},
+		60000,
+	);
+
+for (const device of ["desktop", "phone"] as const)
+	t(
 		`${device} Queue keeps a partly shown short step unread before accepting`,
 		async () => {
 			const server = await startServer({ mode: "local", preset: "standard" });
