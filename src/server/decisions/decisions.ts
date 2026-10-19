@@ -529,6 +529,7 @@ export function answer(ctx: Ctx, input: Parameters<typeof answerSteps>[1]): Deci
 export function* answerSteps(
 	ctx: Ctx,
 	input: { q: string; onEvidence: string; answer: unknown; reason?: string | undefined; ifOpen?: boolean | undefined },
+	mode: "answer" | "replace-inherited" = "answer",
 ): Generator<undefined, DecideReply, void> {
 	const question = mustQuestion(ctx.db, ctx.project.id, input.q);
 	if (input.ifOpen && question.state !== "open") {
@@ -557,6 +558,7 @@ export function* answerSteps(
 		const prior = decisionById(ctx.db, question.decision);
 		if (
 			prior &&
+			mode === "answer" &&
 			!json<{ perResult?: boolean }>(question.subject).perResult &&
 			JSON.stringify(json(prior.answer)) === JSON.stringify(given)
 		)
@@ -601,15 +603,27 @@ export function* answerSteps(
 				const signature = signatureById(ctx.db, subject.signature);
 				const target = json<{ targetId: number }>(question.evidence).targetId;
 				const cause = signature
-					? openFailureQuestion(ctx.db, ctx.project.id, { signature: signature.hash, scope: subject.scope, target })
+					? (openFailureQuestion(ctx.db, ctx.project.id, { signature: signature.hash, scope: subject.scope, target }) ??
+						standingOn(ctx, failureFingerprint(signature.hash, subject.scope)).find(({ question, decision }) =>
+							stillHolds(json<HoldTerm[]>(decision.holds), {
+								hash: question.basis,
+								target,
+								facts: [...factsNow(ctx.db, question)],
+								now: ctx.now,
+							}),
+						)?.question)
 					: null;
-				if (!cause) throw conflict("this failure no longer has an open cause question");
-				const replacement = yield* answerSteps(ctx, {
-					...input,
-					q: questionRef(cause),
-					onEvidence: cause.evidence_hash,
-				});
-				if (replacement.status !== "decided") throw new RefusedReplacement(replacement);
+				if (!cause) throw conflict("this failure no longer has a cause question");
+				const replacement = yield* answerSteps(
+					ctx,
+					{ ...input, q: questionRef(cause), onEvidence: cause.evidence_hash },
+					"replace-inherited",
+				);
+				if (replacement.status !== "decided")
+					throw new RefusedReplacement({
+						...replacement,
+						status: replacement.status === "advised" ? "forbidden" : replacement.status,
+					});
 				return { ...replacement, q: input.q, effects: { ...replacement.effects, question: replacement.q } };
 			});
 		}

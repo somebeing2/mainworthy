@@ -108,10 +108,13 @@ Adopting a policy that allows automatic inheritance restores eligible excuses im
 If you withdraw the rule's answer, the queue keeps one ordinary failure question for you to answer.
 The rule stops answering that commit and cause, including after base or change retries. Another commit or cause can still qualify.
 Replacing the rule's answer directly through `decide` withdraws it and answers that ordinary question in one command.
+Your authorised replacement also takes precedence over another rule that answers the ordinary cause during withdrawal.
 Your answer follows the usual failure holds. A failing base retry does not withdraw your answer, and a flaky answer expires after the policy's limit.
 For a direct replacement, the reply's `q` names the requested question and `effects.question` names the ordinary question holding your decision.
 If withdrawing the rule's answer or answering the ordinary question requires a reason or an admin, a refused replacement keeps the rule's answer.
 The reply says `invalid` for a missing reason or `forbidden` for insufficient permission, with `needs` explaining the requirement.
+If an agent may replace the inherited answer but may only advise on the ordinary cause, the replacement returns `forbidden` and keeps the inherited answer.
+That refused attempt records no advice.
 Use that ordinary question to replace or withdraw your answer later.
 
 Standard and strict policies leave the comparison as a hint for a person. A person's "Already failing on base" answer

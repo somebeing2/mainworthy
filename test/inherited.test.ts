@@ -325,6 +325,112 @@ for (const answer of ["flaky", "defect", "inherited"] as const) {
 	});
 }
 
+for (const answer of ["defect", "flaky"] as const) {
+	test(`a direct ${answer} replacement overrules an automatic ordinary cause answer`, () => {
+		const policy = h.call<Policy & { version: number }>("admin", { do: "policy.show", project: "scratch" });
+		h.call("propose", {
+			edits: [
+				{
+					op: "policy",
+					base: policy.version,
+					clauses: policy.clauses.map((clause) =>
+						clause.id === "failure-change"
+							? { ...clause, ask: { ...clause.ask, who: "rule" }, answer: { is: "flaky" } }
+							: clause,
+					),
+				},
+			],
+		});
+		const adoption = h.call<InboxReply>("inbox", { kind: "adopt" }).items[0];
+		if (!adoption) throw new Error("missing policy adoption");
+		h.call("decide", { q: adoption.q, onEvidence: adoption.evidenceHash, answer: { is: "accept" } });
+		base();
+		change({ 0: "same cause" });
+		const automatic = h.call<InboxReply>("inbox", { state: "decided", kind: "failure", on: "pr:69" }).items[0];
+		if (!automatic) throw new Error("missing inherited answer");
+		const [replacement] = h.call<DecideReply[]>("decide", {
+			q: automatic.q,
+			onEvidence: automatic.evidenceHash,
+			answer: { is: answer },
+		});
+		expect(replacement).toMatchObject({ q: automatic.q, status: "decided" });
+		const decided = h.call<InboxReply>("inbox", { state: "decided", kind: "failure", on: "pr:69" }).items;
+		expect(decided).toHaveLength(1);
+		expect(decided[0]).toMatchObject({
+			q: replacement?.effects?.question,
+			decision: { id: replacement?.decision, answer: { is: answer }, by: ["robin"], rule: null },
+		});
+		expect(decided[0]?.evidence).not.toHaveProperty("inherited");
+		const expected = {
+			verdict: answer === "defect" ? "failed" : "passed",
+			tally: { attributed: answer === "defect" ? 1 : 0, excused: answer === "defect" ? 0 : 1, unexplained: 0 },
+		};
+		expect(gate("change01")).toMatchObject(expected);
+		base({ 0: "same cause" }, 2);
+		expect(gate("change01")).toMatchObject(expected);
+		expect(h.call<InboxReply>("inbox", { state: "decided", kind: "failure", on: "pr:69" }).items[0]).toMatchObject({
+			decision: { id: replacement?.decision, answer: { is: answer }, by: ["robin"] },
+		});
+		if (answer === "flaky") {
+			h.advance(13 * 86_400_000);
+			expect(sweep(h.app, h.owner.id)).toBe(0);
+			h.advance(2 * 86_400_000);
+			expect(sweep(h.app, h.owner.id)).toBe(1);
+		}
+	});
+}
+
+test("an agent's advice-only inherited replacement is refused without claiming lost advice", () => {
+	const policy = h.call<Policy & { version: number }>("admin", { do: "policy.show", project: "scratch" });
+	h.call("propose", {
+		edits: [
+			{
+				op: "policy",
+				base: policy.version,
+				clauses: policy.clauses.map((clause) =>
+					clause.id === "failure-inherited" ? { ...clause, ask: { ...clause.ask, agents: "answer" } } : clause,
+				),
+			},
+		],
+	});
+	const adoption = h.call<InboxReply>("inbox", { kind: "adopt" }).items[0];
+	if (!adoption) throw new Error("missing policy adoption");
+	h.call("decide", { q: adoption.q, onEvidence: adoption.evidenceHash, answer: { is: "accept" } });
+	base();
+	change({ 0: "same cause" });
+	const agent = h.actor("reviewer", "agent", ["read", "produce", "answer"]);
+	const automatic = h.call<InboxReply>("inbox", { state: "decided", kind: "failure", on: "pr:69" }, agent).items[0];
+	if (!automatic) throw new Error("missing inherited answer");
+	expect(
+		h.call(
+			"decide",
+			{
+				q: automatic.q,
+				onEvidence: automatic.evidenceHash,
+				answer: { is: "defect" },
+				reason: "Needs a fix",
+			},
+			agent,
+		),
+	).toMatchObject([
+		{
+			q: automatic.q,
+			status: "forbidden",
+			needs: "one member who is not an agent",
+			decision: null,
+		},
+	]);
+	expect(h.call<InboxReply["items"]>("get", { refs: [automatic.q] })).toMatchObject([
+		{
+			q: automatic.q,
+			state: "decided",
+			decision: { id: automatic.decision?.id, answer: { is: "inherited" } },
+			advice: [],
+		},
+	]);
+	expect(gate("change01")).toMatchObject({ verdict: "passed", tally: { excused: 1, attributed: 0, unexplained: 0 } });
+});
+
 test("Settled keeps an ended cause answer but excludes the inherited question handed off to it", () => {
 	base();
 	change({ 0: "same cause" });
