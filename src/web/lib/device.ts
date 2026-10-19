@@ -73,7 +73,17 @@ export function clearDevicePerson(owner: DeviceSession): void {
 	for (const key of Object.keys(localStorage)) if (key.startsWith(prefix)) localStorage.removeItem(key);
 }
 /** What the device keeps for a person, each under its own kind of key. */
-const PERSON_KINDS = ["active", "draft", "draft-copy", "home", "queue-input", "run-note", "run-step", "steps"] as const;
+const PERSON_KINDS = [
+	"active",
+	"draft",
+	"draft-copy",
+	"home",
+	"queue-input",
+	"run-note",
+	"run-plan",
+	"run-step",
+	"steps",
+] as const;
 type PersonKind = (typeof PERSON_KINDS)[number];
 /** `#` is escaped in every name, so no sign-in name can write a key of this shape. */
 const personPrefix = (actor: ActorId): string => `mainworthy:#${actor}:`;

@@ -40,11 +40,23 @@ The API can preview the same selection with `find` and `{"in":"cases","select":{
 When `select.cases` names a case more than once, the preview and plan count it once.
 Without folder, tag, or search criteria, an explicit case list keeps the order of first appearance.
 If you open another screen while planning finishes, the run is recorded and you stay on that screen.
-If the reply is lost or unreadable, the planner keeps your submitted choices and locks them.
-While the planner stays open, choose **Retry plan** or press <kbd>Enter</kbd> to resend the same request
-without creating a second run.
-The locked fields are dimmed. <kbd>Esc</kbd> still closes the planner.
-If the server refuses the plan, you can correct the choices and submit again.
+Before sending a plan, the browser keeps the request for your signed-in account and project on this device.
+If the reply is lost or unreadable, the planner locks and dims your submitted choices.
+Choose **Retry plan** or press <kbd>Enter</kbd> to resend the same request without creating a second run.
+**Cancel** and <kbd>Esc</kbd> close the planner and keep the request while its outcome is unknown.
+After closing the planner, visiting another screen or project, or reloading the page, reopen the planner
+in the same project to retry. A readable success clears the request.
+A session change, permission refusal, rate limit, or server error also keeps it.
+If the operation refuses the request, the planner shows the reason and unlocks your choices for correction,
+even after a retry. The server replays a recorded request before running the operation again.
+If the project is missing or you no longer have a grant on it, the request stays available to retry.
+To release a request whose outcome is unknown, choose **Discard this plan**. The plan may already have
+been recorded. Discarding the saved request does not undo a run.
+If another tab saved a plan while you were typing, submitting first shows that plan and a notice.
+Choose **Retry plan** to send the displayed request.
+Invalid or older-format saved requests are removed and do not prevent a fresh plan.
+The browser must be able to save the request before it sends a plan. Clearing this site's browser data
+or signing out with **Sign out and clear browser data** removes any request still kept on this device.
 "Count only results recorded in this run" accepts work explicitly reported to the run.
 "Accept results for a commit" also accepts qualifying results already reported for
 that commit and results that arrive later. Enter the tested commit's hash.
